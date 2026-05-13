@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.98)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-k", type=int, default=None)
-    parser.add_argument("--flashvid-path", type=Path, default=REPO_ROOT / "candidate" / "FlashVID")
+    parser.add_argument("--flashvid-path", type=Path, default=REPO_ROOT / "FlashVID")
     parser.add_argument("--token-selection-method", default="attn")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--temporal-threshold", type=float, default=1.0)
