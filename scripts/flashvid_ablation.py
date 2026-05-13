@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-complementary-segment", action="store_true")
     parser.add_argument("--expansion", type=float, default=1.25)
     parser.add_argument("--pruning-layer", type=int, default=28)
-    parser.add_argument("--llm-retention-ratio", type=float, default=0.1)
+    parser.add_argument("--llm-retention-ratio", type=float, default=1.0)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 

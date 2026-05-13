@@ -156,6 +156,32 @@ class Alpamayo1_5(ReasoningVLA):
         return torch.where(has_eos, eos_positions, last_positions) + 1
 
     @staticmethod
+    def _project_flashvid_prefix_mask(
+        prefix_mask: torch.Tensor | None,
+        vlm: Any,
+    ) -> tuple[torch.Tensor | None, int]:
+        """Project the original prompt mask onto FlashVID's compressed prefill tokens."""
+        if prefix_mask is None:
+            return None, 0
+
+        flashvid_config = getattr(vlm, "flashvid_config", None)
+        keep_indices = getattr(flashvid_config, "prefill_keep_indices", None)
+        if keep_indices is None:
+            return prefix_mask, 0
+
+        keep_indices = keep_indices.to(device=prefix_mask.device)
+        keep_indices = keep_indices[keep_indices < prefix_mask.shape[-1]]
+        projected_mask = prefix_mask.index_select(dim=-1, index=keep_indices)
+        removed_tokens = prefix_mask.shape[-1] - projected_mask.shape[-1]
+        return projected_mask, removed_tokens
+
+    @staticmethod
+    def _adjust_flashvid_offset(offset: torch.Tensor, removed_tokens: int) -> torch.Tensor:
+        if removed_tokens <= 0:
+            return offset
+        return torch.clamp(offset - removed_tokens, min=0)
+
+    @staticmethod
     def _build_expert_pos_ids_and_attn_mask(
         offset: torch.Tensor,
         rope_deltas: torch.Tensor,
@@ -183,6 +209,7 @@ class Alpamayo1_5(ReasoningVLA):
             attention_mask: [b_star, 1, n_diffusion_tokens, KV] — 4D float mask
                 (0 = attend, -inf = masked).
         """
+        offset = torch.clamp(offset, min=0, max=kv_cache_seq_len)
         # Qwen2.5-VL uses 3-component (temporal, height, width) RoPE
         position_ids = torch.arange(n_diffusion_tokens, device=device)
         position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
@@ -202,11 +229,12 @@ class Alpamayo1_5(ReasoningVLA):
         # Propagate input padding mask (left-padding) into the KV prefix region
         if prefix_mask is not None:
             # [b_star, H, Q, KV]
-            input_mask = prefix_mask[:, None, None, :]
-            attention_mask[:, :, :, : input_mask.shape[-1]] = torch.where(
+            prefix_len = min(prefix_mask.shape[-1], attention_mask.shape[-1])
+            input_mask = prefix_mask[:, None, None, :prefix_len]
+            attention_mask[:, :, :, :prefix_len] = torch.where(
                 input_mask == 0,
                 torch.finfo(attention_mask.dtype).min,
-                attention_mask[:, :, :, : input_mask.shape[-1]],
+                attention_mask[:, :, :, :prefix_len],
             )
 
         return position_ids, attention_mask
@@ -308,6 +336,10 @@ class Alpamayo1_5(ReasoningVLA):
             device=device,
         )
         prefix_mask = tokenized_data.get("attention_mask")
+        prefix_mask, removed_prefix_tokens = self._project_flashvid_prefix_mask(
+            prefix_mask, self.vlm
+        )
+        offset = self._adjust_flashvid_offset(offset, removed_prefix_tokens)
         if prefix_mask is not None:
             prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
         position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
@@ -500,6 +532,10 @@ class Alpamayo1_5(ReasoningVLA):
             device=device,
         )
         prefix_mask = tokenized_data.get("attention_mask")
+        prefix_mask, removed_prefix_tokens = self._project_flashvid_prefix_mask(
+            prefix_mask, self.vlm
+        )
+        offset = self._adjust_flashvid_offset(offset, removed_prefix_tokens)
         if prefix_mask is not None:
             prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
         position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
@@ -539,6 +575,9 @@ class Alpamayo1_5(ReasoningVLA):
         # Step 2: Repeat KV cache for n_samples_total (cheap memory copy, no recomputation)
         # Free the prefill outputs first — we only need the KV cache, not the logits
         unguided_prompt_cache = unguided_prefill_outputs.past_key_values
+        unguided_prefix_mask, unguided_removed_prefix_tokens = (
+            self._project_flashvid_prefix_mask(unguided_prefix_mask, self.vlm)
+        )
         del unguided_prefill_outputs
         torch.cuda.empty_cache()
         unguided_prompt_cache.batch_repeat_interleave(n_samples_total)
@@ -546,7 +585,7 @@ class Alpamayo1_5(ReasoningVLA):
         # Step 3: Forward generated_tokens (which differ per sample) using the repeated
         # KV cache. No pixel_values needed — images are already encoded in the cache.
         generated_tokens = vlm_outputs.sequences[:, input_ids.shape[1] :]
-        unguided_prefix_len = unguided_input_ids.shape[1]
+        unguided_prefix_len = unguided_prefix_mask.shape[1]
         gen_len = generated_tokens.shape[1]
 
         prefix_mask_repeated = unguided_prefix_mask.repeat_interleave(n_samples_total, dim=0)
@@ -581,6 +620,9 @@ class Alpamayo1_5(ReasoningVLA):
             eos_token_id=eos_token_id,
             device=device,
             warn=False,
+        )
+        unguided_offset = self._adjust_flashvid_offset(
+            unguided_offset, unguided_removed_prefix_tokens
         )
         unguided_prefix_mask_repeated = torch.repeat_interleave(
             unguided_prefix_mask, n_samples_total, dim=0
