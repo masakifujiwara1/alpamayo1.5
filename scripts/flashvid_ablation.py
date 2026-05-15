@@ -400,6 +400,7 @@ def apply_flashvid(model: Any, args: argparse.Namespace, ratio: float) -> None:
 
 
 def main() -> None:
+    torch.backends.cuda.preferred_linalg_library("magma")
     args = parse_args()
     dtype = dtype_from_name(args.dtype)
     family_name = infer_model_family(args.model_family, args.model_id)
